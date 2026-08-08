@@ -2,3 +2,4 @@ requests
 pandas
 hopsworks
 confluent-kafka
+pyarrow
