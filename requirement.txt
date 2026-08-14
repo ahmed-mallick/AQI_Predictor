@@ -3,3 +3,6 @@ pandas
 hopsworks
 confluent-kafka
 pyarrow
+scikit-learn
+joblib
+numpy
