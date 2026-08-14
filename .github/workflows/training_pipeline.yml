@@ -1,0 +1,26 @@
+name: Training Pipeline
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # roz raat 2 AM UTC pe chalega
+  workflow_dispatch:        # manual run button bhi milega
+
+jobs:
+  run-training-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirement.txt
+
+      - name: Run training pipeline
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+        run: python training_pipeline.py
