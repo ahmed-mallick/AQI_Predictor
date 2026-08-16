@@ -7,3 +7,6 @@ scikit-learn
 joblib
 numpy
 streamlit
+fastapi
+uvicorn
+tensorflow
