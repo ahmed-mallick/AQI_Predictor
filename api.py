@@ -29,12 +29,13 @@ def get_project():
     global _project
     if _project is None:
         if not HOPSWORKS_API_KEY:
-            raise ValueError("HOPSWORKS_API_KEY environment variable missing!")
+            raise ValueError("HOPSWORKS_API_KEY environment variable is missing!")
             
+        # Explicit host and project pass karne se JSONDecodeError fix ho jata hai
         _project = hopsworks.login(
             host="app.hopsworks.ai",
             api_key_value=HOPSWORKS_API_KEY,
-            project=HOPSWORKS_PROJECT_NAME if HOPSWORKS_PROJECT_NAME else None
+            project=HOPSWORKS_PROJECT_NAME if HOPSWORKS_PROJECT_NAME else "xbc"
         )
     return _project
 
