@@ -14,9 +14,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HOPSWORKS_API_KEY = os.environ.get("HOPSWORKS_API_KEY")
+# Render Environment variable se API key sanitization ke sath read karein
+HOPSWORKS_API_KEY = os.environ.get("HOPSWORKS_API_KEY", "").strip()
+HOPSWORKS_PROJECT_NAME = os.environ.get("HOPSWORKS_PROJECT_NAME", "").strip() # E.g., "xbc" ya jo project name hai
+
 WEATHER_FG_NAME = "karachi_weather_features"
 WEATHER_FG_VERSION = 1
+HAZARD_THRESHOLD = 150
 
 _project = None
 _models_cache = {}
@@ -24,10 +28,14 @@ _models_cache = {}
 def get_project():
     global _project
     if _project is None:
+        if not HOPSWORKS_API_KEY:
+            raise ValueError("HOPSWORKS_API_KEY environment variable missing!")
+            
         _project = hopsworks.login(
-           host="app.hopsworks.ai",
-           api_key_value=HOPSWORKS_API_KEY
-)
+            host="app.hopsworks.ai",
+            api_key_value=HOPSWORKS_API_KEY,
+            project=HOPSWORKS_PROJECT_NAME if HOPSWORKS_PROJECT_NAME else None
+        )
     return _project
 
 def get_model(horizon_name):
@@ -111,6 +119,15 @@ def current_aqi():
         "datetime_utc": str(latest["datetime_utc"]),
     }
 
+@app.get("/history")
+def history(hours: int = 72):
+    df = get_latest_features()
+    recent_df = df.tail(hours)
+    return {
+        "timestamps": recent_df["datetime_utc"].tolist(),
+        "aqi": recent_df["aqi"].astype(int).tolist()
+    }
+
 @app.get("/predict/{horizon}")
 def predict(horizon: str):
     if horizon not in ["24h", "48h", "72h"]:
@@ -126,6 +143,21 @@ def predict(horizon: str):
     try:
         model_entry = get_model(horizon)
         pred = round(predict_with_model(model_entry, X))
-        return {"horizon": horizon, "predicted_aqi": pred, "model_type": model_entry["type"]}
+        return {
+            "horizon": horizon,
+            "predicted_aqi": pred,
+            "model_type": model_entry["type"],
+            "is_hazardous": pred > HAZARD_THRESHOLD
+        }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Model not available: {str(e)}")
+
+@app.get("/predict_all")
+def predict_all():
+    results = {}
+    for horizon in ["24h", "48h", "72h"]:
+        try:
+            results[horizon] = predict(horizon)
+        except Exception as e:
+            results[horizon] = {"error": str(e)}
+    return results
