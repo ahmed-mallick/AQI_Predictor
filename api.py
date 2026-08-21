@@ -15,6 +15,8 @@ app.add_middleware(
 )
 
 HOPSWORKS_API_KEY = os.environ.get("HOPSWORKS_API_KEY")
+WEATHER_FG_NAME = "karachi_weather_features"
+WEATHER_FG_VERSION = 1
 
 _project = None
 _models_cache = {}
@@ -26,20 +28,17 @@ def get_project():
     return _project
 
 def get_model(horizon_name):
-    """Model download karke uska type detect karta hai (sklearn ya NN), aur predict-ready object return karta hai"""
     if horizon_name not in _models_cache:
         project = get_project()
         mr = project.get_model_registry()
         model_obj = mr.get_model(name=f"aqi_predictor_{horizon_name}")
         model_dir = model_obj.download()
 
-        # Model type check karo
         model_type_path = f"{model_dir}/model_type.pkl"
         if os.path.exists(model_type_path):
-            model_type_info = joblib.load(model_type_path)
-            model_type = model_type_info.get("type", "sklearn")
+            model_type = joblib.load(model_type_path).get("type", "sklearn")
         else:
-            model_type = "sklearn"  # purane models ke liye fallback
+            model_type = "sklearn"
 
         if model_type == "nn":
             import tensorflow as tf
@@ -53,7 +52,6 @@ def get_model(horizon_name):
     return _models_cache[horizon_name]
 
 def predict_with_model(model_entry, X):
-    """Model type ke hisaab se sahi predict method use karta hai"""
     if model_entry["type"] == "nn":
         X_scaled = model_entry["scaler"].transform(X)
         pred = model_entry["model"].predict(X_scaled, verbose=0).flatten()[0]
@@ -64,8 +62,14 @@ def predict_with_model(model_entry, X):
 def get_latest_features():
     project = get_project()
     fs = project.get_feature_store()
+
     aqi_fg = fs.get_feature_group(name="karachi_aqi_features", version=1)
-    df = aqi_fg.read()
+    df_pollution = aqi_fg.read()
+
+    weather_fg = fs.get_feature_group(name=WEATHER_FG_NAME, version=WEATHER_FG_VERSION)
+    df_weather = weather_fg.read()
+
+    df = pd.merge(df_pollution, df_weather, on="timestamp", how="inner", suffixes=("", "_weather"))
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     df["aqi_lag_1"] = df["aqi"].shift(1)
@@ -78,7 +82,8 @@ def get_latest_features():
 FEATURE_COLS = [
     "hour", "day", "month", "day_of_week",
     "pm2_5", "pm10", "co", "no2", "o3", "so2",
-    "aqi_lag_1", "aqi_lag_3", "aqi_rolling_mean_3", "aqi_change_rate"
+    "aqi_lag_1", "aqi_lag_3", "aqi_rolling_mean_3", "aqi_change_rate",
+    "temperature", "humidity", "pressure", "wind_speed", "clouds",
 ]
 
 @app.get("/")
@@ -97,6 +102,9 @@ def current_aqi():
         "no2": float(latest["no2"]),
         "o3": float(latest["o3"]),
         "so2": float(latest["so2"]),
+        "temperature": float(latest["temperature"]),
+        "humidity": float(latest["humidity"]),
+        "wind_speed": float(latest["wind_speed"]),
         "datetime_utc": str(latest["datetime_utc"]),
     }
 

@@ -12,20 +12,47 @@ from tensorflow import keras
 
 # ---------- CONFIG ----------
 HOPSWORKS_API_KEY = os.environ["HOPSWORKS_API_KEY"]
+WEATHER_FG_NAME = "karachi_weather_features"
+WEATHER_FG_VERSION = 1
 
-# ---------- STEP 1: Feature Store se data nikalo ----------
+# ---------- STEP 1: Dono Feature Groups Se Data Fetch Aur Join Karo ----------
 def fetch_training_data():
     project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
     fs = project.get_feature_store()
     mr = project.get_model_registry()
 
     aqi_fg = fs.get_feature_group(name="karachi_aqi_features", version=1)
-    df = aqi_fg.read()
+    df_pollution = aqi_fg.read()
+
+    weather_fg = fs.get_feature_group(name=WEATHER_FG_NAME, version=WEATHER_FG_VERSION)
+    df_weather = weather_fg.read()
+
+    # timestamp pe join karo
+    df = pd.merge(df_pollution, df_weather, on="timestamp", how="inner", suffixes=("", "_weather"))
     df = df.sort_values("timestamp").reset_index(drop=True)
+
     return df, project, mr
 
-# ---------- STEP 2: Feature Engineering ----------
+# ---------- STEP 2: Feature Engineering (Timeline Fix + Weather Included) ----------
 def prepare_data(df):
+    df = df.copy()
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"])
+    df = df.set_index("datetime_utc").sort_index()
+    df = df[~df.index.duplicated(keep="first")]
+
+    full_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq="h")
+    df = df.reindex(full_range)
+
+    numeric_cols = ["pm2_5", "pm10", "co", "no2", "o3", "so2", "aqi",
+                     "temperature", "humidity", "pressure", "wind_speed", "clouds"]
+    numeric_cols = [c for c in numeric_cols if c in df.columns]
+    df[numeric_cols] = df[numeric_cols].interpolate(method="linear", limit=6)
+
+    df["hour"] = df.index.hour
+    df["day"] = df.index.day
+    df["month"] = df.index.month
+    df["day_of_week"] = df.index.dayofweek
+
     df["aqi_lag_1"] = df["aqi"].shift(1)
     df["aqi_lag_3"] = df["aqi"].shift(3)
     df["aqi_rolling_mean_3"] = df["aqi"].rolling(window=3).mean()
@@ -35,9 +62,17 @@ def prepare_data(df):
     df["target_48h"] = df["aqi"].shift(-48)
     df["target_72h"] = df["aqi"].shift(-72)
 
+    df = df.reset_index().rename(columns={"index": "datetime_utc"})
     return df
 
-# ---------- STEP 3: Neural Network banao ----------
+FEATURE_COLS = [
+    "hour", "day", "month", "day_of_week",
+    "pm2_5", "pm10", "co", "no2", "o3", "so2",
+    "aqi_lag_1", "aqi_lag_3", "aqi_rolling_mean_3", "aqi_change_rate",
+    "temperature", "humidity", "pressure", "wind_speed", "clouds",  # 👈 NAYE WEATHER FEATURES
+]
+
+# ---------- STEP 3: Neural Network ----------
 def build_nn_model(input_dim):
     model = keras.Sequential([
         keras.layers.Input(shape=(input_dim,)),
@@ -49,21 +84,15 @@ def build_nn_model(input_dim):
     model.compile(optimizer="adam", loss="mse", metrics=["mae"])
     return model
 
-# ---------- STEP 4: Train aur Compare (3 models) ----------
+# ---------- STEP 4: Train aur Compare ----------
 def train_for_horizon(df, target_col, horizon_name):
-    feature_cols = [
-        "hour", "day", "month", "day_of_week",
-        "pm2_5", "pm10", "co", "no2", "o3", "so2",
-        "aqi_lag_1", "aqi_lag_3", "aqi_rolling_mean_3", "aqi_change_rate"
-    ]
-
-    data = df.dropna(subset=feature_cols + [target_col])
+    data = df.dropna(subset=FEATURE_COLS + [target_col])
 
     if len(data) < 10:
         print(f"WARNING: {horizon_name} - sirf {len(data)} usable rows hain, skip kar rahe hain")
         return None, None, None
 
-    X = data[feature_cols]
+    X = data[FEATURE_COLS]
     y = data[target_col]
 
     split_idx = max(1, int(len(data) * 0.8))
@@ -85,7 +114,7 @@ def train_for_horizon(df, target_col, horizon_name):
 
     sklearn_models = {
         "Ridge (Statistical)": Ridge(alpha=1.0),
-        "RandomForest (ML)": RandomForestRegressor(n_estimators=100, random_state=42),
+        "RandomForest (ML)": RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42),
     }
 
     for name, model in sklearn_models.items():
@@ -106,7 +135,7 @@ def train_for_horizon(df, target_col, horizon_name):
     nn_model.fit(
         X_train_scaled, y_train,
         validation_split=0.1 if len(X_train) > 10 else 0,
-        epochs=100, batch_size=8, verbose=0,
+        epochs=100, batch_size=32, verbose=0,
         callbacks=[keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True)]
     )
     nn_preds = nn_model.predict(X_test_scaled, verbose=0).flatten()
@@ -124,7 +153,7 @@ def train_for_horizon(df, target_col, horizon_name):
     print(f"Best for {horizon_name}: {best_name}")
     return best_model, best_name, best_is_nn
 
-# ---------- STEP 5: Model Registry mein save karo ----------
+# ---------- STEP 5: Model Registry Mein Save ----------
 def save_model_to_registry(model, mr, horizon_name, is_nn):
     if model is None:
         return
@@ -143,7 +172,7 @@ def save_model_to_registry(model, mr, horizon_name, is_nn):
 
     mr_model = mr.python.create_model(
         name=f"aqi_predictor_{horizon_name}",
-        description=f"Best AQI prediction model for {horizon_name} horizon"
+        description=f"Best AQI prediction model for {horizon_name} horizon (with weather features)"
     )
     mr_model.save(model_dir)
     print(f"Saved: {horizon_name} model to Model Registry")
@@ -155,11 +184,7 @@ if __name__ == "__main__":
 
     df = prepare_data(df)
 
-    horizons = {
-        "24h": "target_24h",
-        "48h": "target_48h",
-        "72h": "target_72h",
-    }
+    horizons = {"24h": "target_24h", "48h": "target_48h", "72h": "target_72h"}
 
     for horizon_name, target_col in horizons.items():
         model, model_name, is_nn = train_for_horizon(df, target_col, horizon_name)
