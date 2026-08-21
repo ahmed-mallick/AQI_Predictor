@@ -24,7 +24,10 @@ _models_cache = {}
 def get_project():
     global _project
     if _project is None:
-        _project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
+        _project = hopsworks.login(
+           host="app.hopsworks.ai",
+           api_key_value=HOPSWORKS_API_KEY
+)
     return _project
 
 def get_model(horizon_name):
