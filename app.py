@@ -50,14 +50,14 @@ def aqi_category(aqi):
 
 @st.cache_data(ttl=1800)
 def get_current_aqi():
-    r = requests.get(f"{API_URL}/current", timeout=15)
+    r = requests.get(f"{API_URL}/current", timeout=90)
     r.raise_for_status()
     return r.json()
 
 
 @st.cache_data(ttl=1800)
 def get_history(hours=72):
-    r = requests.get(f"{API_URL}/history", params={"hours": hours}, timeout=20)
+    r = requests.get(f"{API_URL}/history", params={"hours": hours}, timeout=90)
     r.raise_for_status()
     return r.json()
 
@@ -65,7 +65,7 @@ def get_history(hours=72):
 @st.cache_data(ttl=1800)
 def get_predictions_all():
     """One round trip for all 3 horizons instead of 3 separate calls."""
-    r = requests.get(f"{API_URL}/predict_all", timeout=30)
+    r = requests.get(f"{API_URL}/predict_all", timeout=90)
     r.raise_for_status()
     return r.json()
 
