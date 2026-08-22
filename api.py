@@ -33,9 +33,9 @@ def get_project():
             
         # Explicit host and project pass karne se JSONDecodeError fix ho jata hai
         _project = hopsworks.login(
-            host="app.hopsworks.ai",
             api_key_value=HOPSWORKS_API_KEY,
-            project=HOPSWORKS_PROJECT_NAME if HOPSWORKS_PROJECT_NAME else "xbc"
+            project=HOPSWORKS_PROJECT_NAME,
+            engine="python",
         )
     return _project
 
