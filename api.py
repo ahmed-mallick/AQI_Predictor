@@ -17,6 +17,7 @@ app.add_middleware(
 # Render Environment variable se API key sanitization ke sath read karein
 HOPSWORKS_API_KEY = os.environ.get("HOPSWORKS_API_KEY", "").strip()
 HOPSWORKS_PROJECT_NAME = os.environ.get("HOPSWORKS_PROJECT_NAME", "").strip() # E.g., "xbc" ya jo project name hai
+HOPSWORKS_HOST = os.environ.get("HOPSWORKS_HOST", "").strip()
 
 WEATHER_FG_NAME = "karachi_weather_features"
 WEATHER_FG_VERSION = 1
@@ -27,16 +28,21 @@ _models_cache = {}
 
 def get_project():
     global _project
+
     if _project is None:
         if not HOPSWORKS_API_KEY:
             raise ValueError("HOPSWORKS_API_KEY environment variable is missing!")
-            
-        # Explicit host and project pass karne se JSONDecodeError fix ho jata hai
+        if not HOPSWORKS_HOST:
+            raise ValueError("HOPSWORKS_HOST environment variable is missing!")
+
         _project = hopsworks.login(
+            host=HOPSWORKS_HOST,
+            port=443,
             api_key_value=HOPSWORKS_API_KEY,
             project=HOPSWORKS_PROJECT_NAME,
             engine="python",
         )
+
     return _project
 
 def get_model(horizon_name):
