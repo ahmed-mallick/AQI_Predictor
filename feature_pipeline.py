@@ -2,10 +2,10 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 import hopsworks
-
+import os
 # ---------- CONFIG ----------
-OPENWEATHER_API_KEY = "apni_openweather_key_yahan_daalo"
-HOPSWORKS_API_KEY = "apni_hopsworks_key_yahan_daalo"
+OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
+HOPSWORKS_API_KEY = os.environ.get("HOPSWORKS_API_KEY")
 LAT = 24.8607
 LON = 67.0011
 
