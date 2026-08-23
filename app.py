@@ -1,21 +1,45 @@
 import os
-import streamlit as st
+import joblib
+import numpy as np
 import pandas as pd
+import streamlit as st
 import altair as alt
 import hopsworks
-import joblib
+
+# TensorFlow sirf tab chahiye jab kisi horizon ka best model Neural Network ho.
+# Isay lazy-import karte hain taake agar TF is machine par load na ho paye
+# (jaisa Windows DLL issues mein hota hai), sklearn-based horizons phir bhi kaam karein.
+_tf_keras = None
+_tf_import_error = None
+
+
+def get_keras():
+    global _tf_keras, _tf_import_error
+    if _tf_keras is None and _tf_import_error is None:
+        try:
+            from tensorflow import keras as _keras
+            _tf_keras = _keras
+        except Exception as e:
+            _tf_import_error = e
+    return _tf_keras
 
 st.set_page_config(page_title="Karachi AQI Predictor", page_icon="🌫️", layout="wide")
 
 HAZARD_THRESHOLD = 150
+AQI_FG_NAME = "karachi_aqi_features"
+AQI_FG_VERSION = 1
 WEATHER_FG_NAME = "karachi_weather_features"
 WEATHER_FG_VERSION = 1
+
+# Must match training_pipeline.py exactly, or predictions will silently use wrong columns.
 FEATURE_COLS = [
     "hour", "day", "month", "day_of_week",
     "pm2_5", "pm10", "co", "no2", "o3", "so2",
     "aqi_lag_1", "aqi_lag_3", "aqi_rolling_mean_3", "aqi_change_rate",
     "temperature", "humidity", "pressure", "wind_speed", "clouds",
 ]
+
+HORIZONS = {"24h": ("Tomorrow", 24), "48h": ("Day After", 48), "72h": ("In 3 Days", 72)}
 
 # ---------- CUSTOM CSS (unchanged from original) ----------
 st.markdown("""
@@ -55,83 +79,98 @@ def aqi_category(aqi):
     else: return "Hazardous", "#7f1d1d", "🟤"
 
 
-def get_hopsworks_api_key():
-    """Read the key locally from Streamlit secrets or an environment variable."""
-    try:
-        return st.secrets.get("HOPSWORKS_API_KEY", os.environ.get("HOPSWORKS_API_KEY", "")).strip()
-    except FileNotFoundError:
-        return os.environ.get("HOPSWORKS_API_KEY", "").strip()
-
-
-@st.cache_resource
+# ---------- HOPSWORKS CONNECTION ----------
+@st.cache_resource(ttl=3600)
 def get_project():
-    api_key = get_hopsworks_api_key()
-    if not api_key:
-        raise ValueError("HOPSWORKS_API_KEY is missing. Add it to .streamlit/secrets.toml.")
-    try:
-        project_name = st.secrets.get(
-            "HOPSWORKS_PROJECT_NAME", os.environ.get("HOPSWORKS_PROJECT_NAME", "")
-        ).strip()
-    except FileNotFoundError:
-        project_name = os.environ.get("HOPSWORKS_PROJECT_NAME", "").strip()
-    return hopsworks.login(
-        host="app.hopsworks.ai",
-        api_key_value=api_key,
-        project=project_name or None,
-    )
+    api_key = st.secrets["HOPSWORKS_API_KEY"]
+    return hopsworks.login(api_key_value=api_key)
 
 
+# ---------- DATA FETCH (mirrors training_pipeline.py) ----------
 @st.cache_data(ttl=1800)
-def get_latest_features():
-    feature_store = get_project().get_feature_store()
-    pollution = feature_store.get_feature_group(name="karachi_aqi_features", version=1).read()
-    weather = feature_store.get_feature_group(
-        name=WEATHER_FG_NAME, version=WEATHER_FG_VERSION
-    ).read()
-    df = pd.merge(pollution, weather, on="timestamp", how="inner", suffixes=("", "_weather"))
+def fetch_raw_data():
+    project = get_project()
+    fs = project.get_feature_store()
+
+    aqi_fg = fs.get_feature_group(name=AQI_FG_NAME, version=AQI_FG_VERSION)
+    df_pollution = aqi_fg.read()
+
+    weather_fg = fs.get_feature_group(name=WEATHER_FG_NAME, version=WEATHER_FG_VERSION)
+    df_weather = weather_fg.read()
+
+    df = pd.merge(df_pollution, df_weather, on="timestamp", how="inner", suffixes=("", "_weather"))
     df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
+
+
+def prepare_features(df):
+    """Same feature engineering as training_pipeline.prepare_data, minus the target columns."""
+    df = df.copy()
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"])
+    df = df.set_index("datetime_utc").sort_index()
+    df = df[~df.index.duplicated(keep="first")]
+
+    full_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq="h")
+    df = df.reindex(full_range)
+
+    numeric_cols = ["pm2_5", "pm10", "co", "no2", "o3", "so2", "aqi",
+                     "temperature", "humidity", "pressure", "wind_speed", "clouds"]
+    numeric_cols = [c for c in numeric_cols if c in df.columns]
+    df[numeric_cols] = df[numeric_cols].interpolate(method="linear", limit=6)
+
+    df["hour"] = df.index.hour
+    df["day"] = df.index.day
+    df["month"] = df.index.month
+    df["day_of_week"] = df.index.dayofweek
+
     df["aqi_lag_1"] = df["aqi"].shift(1)
     df["aqi_lag_3"] = df["aqi"].shift(3)
     df["aqi_rolling_mean_3"] = df["aqi"].rolling(window=3).mean()
     df["aqi_change_rate"] = df["aqi"].diff()
+
+    df = df.reset_index().rename(columns={"index": "datetime_utc"})
     return df
 
 
-@st.cache_resource
-def get_model(horizon_name):
-    model_dir = get_project().get_model_registry().get_model(
-        name=f"aqi_predictor_{horizon_name}"
-    ).download()
-    model_type_path = os.path.join(model_dir, "model_type.pkl")
-    model_type = joblib.load(model_type_path).get("type", "sklearn") if os.path.exists(model_type_path) else "sklearn"
-    if model_type == "nn":
-        import tensorflow as tf
-        return {"type": "nn", "model": tf.keras.models.load_model(os.path.join(model_dir, "nn_model.keras")), "scaler": joblib.load(os.path.join(model_dir, "scaler.pkl"))}
-    return {"type": "sklearn", "model": joblib.load(os.path.join(model_dir, "model.pkl"))}
+# ---------- MODEL LOADING (from Hopsworks Model Registry) ----------
+@st.cache_resource(ttl=3600)
+def load_model(horizon_name):
+    project = get_project()
+    mr = project.get_model_registry()
+
+    models = mr.get_models(name=f"aqi_predictor_{horizon_name}")
+    if not models:
+        return None
+    model_meta = max(models, key=lambda m: m.version)
+    model_dir = model_meta.download()
+
+    model_type = joblib.load(os.path.join(model_dir, "model_type.pkl"))
+    if model_type["type"] == "nn":
+        keras = get_keras()
+        if keras is None:
+            # TensorFlow load nahi ho saka is machine par — is horizon ko skip kar dein
+            # bajaye poori app crash karne ke.
+            return None
+        nn_model = keras.models.load_model(os.path.join(model_dir, "nn_model.keras"))
+        scaler = joblib.load(os.path.join(model_dir, "scaler.pkl"))
+        return ("nn", nn_model, scaler)
+    else:
+        model = joblib.load(os.path.join(model_dir, "model.pkl"))
+        return ("sklearn", model, None)
 
 
-def get_current_aqi(df):
-    latest = df.iloc[-1]
-    return {
-        "aqi": int(latest["aqi"]), "pm2_5": float(latest["pm2_5"]),
-        "pm10": float(latest["pm10"]), "co": float(latest["co"]),
-        "no2": float(latest["no2"]), "o3": float(latest["o3"]),
-        "so2": float(latest["so2"]), "datetime_utc": str(latest["datetime_utc"]),
-    }
-
-
-def get_predictions_all(df):
-    latest_features = df.iloc[-1][FEATURE_COLS].to_frame().T.astype(float)
-    if latest_features.isnull().values.any():
-        return {}
-    predictions = {}
-    for horizon in ("24h", "48h", "72h"):
-        model_entry = get_model(horizon)
-        X = model_entry["scaler"].transform(latest_features) if model_entry["type"] == "nn" else latest_features
-        prediction = model_entry["model"].predict(X, verbose=0).flatten()[0] if model_entry["type"] == "nn" else model_entry["model"].predict(X)[0]
-        prediction = round(float(prediction))
-        predictions[horizon] = {"predicted_aqi": prediction, "is_hazardous": prediction > HAZARD_THRESHOLD}
-    return predictions
+def predict_horizon(horizon_name, feature_row):
+    bundle = load_model(horizon_name)
+    if bundle is None:
+        return None
+    kind, model, scaler = bundle
+    X = feature_row[FEATURE_COLS].to_numpy(dtype=float).reshape(1, -1)
+    if kind == "nn":
+        X = scaler.transform(X)
+        pred = model.predict(X, verbose=0).flatten()[0]
+    else:
+        pred = model.predict(X)[0]
+    return round(float(pred))
 
 
 # ---------- HEADER ----------
@@ -140,16 +179,22 @@ st.markdown("""
 <p class="subtitle">3-day Air Quality Index forecast, powered by a serverless ML pipeline</p>
 """, unsafe_allow_html=True)
 
-with st.spinner("Loading latest data..."):
+with st.spinner("Loading latest data from Hopsworks..."):
     try:
-        features_df = get_latest_features()
-        current = get_current_aqi(features_df)
+        raw_df = fetch_raw_data()
+        df = prepare_features(raw_df)
     except Exception as e:
         st.error(f"Could not load AQI data from Hopsworks. ({e})")
         st.stop()
 
-latest_aqi = current["aqi"]
-latest_time = pd.to_datetime(current["datetime_utc"])
+valid_df = df.dropna(subset=FEATURE_COLS + ["aqi"])
+if valid_df.empty:
+    st.error("Not enough data yet to show predictions. Please run the feature pipeline a few more times.")
+    st.stop()
+
+latest_row = valid_df.iloc[-1]
+latest_aqi = int(latest_row["aqi"])
+latest_time = pd.to_datetime(latest_row["datetime_utc"])
 category, color, emoji = aqi_category(latest_aqi)
 
 if latest_aqi > HAZARD_THRESHOLD:
@@ -171,27 +216,23 @@ st.markdown(f"""
 # ---------- FORECAST ----------
 st.markdown("### 📅 3-Day Forecast")
 
-horizons = {"24h": ("Tomorrow", 1), "48h": ("Day After", 2), "72h": ("In 3 Days", 3)}
 predictions = {}
 hazard_horizons = []
 
-try:
-    all_preds = get_predictions_all(features_df)
-except Exception as e:
-    st.warning(f"Forecast unavailable: {e}")
-    all_preds = {}
-
 cols = st.columns(3)
-for i, (horizon_name, (label, days)) in enumerate(horizons.items()):
-    entry = all_preds.get(horizon_name, {})
-    if "predicted_aqi" not in entry:
+for i, (horizon_name, (label, hours_ahead)) in enumerate(HORIZONS.items()):
+    try:
+        pred = predict_horizon(horizon_name, latest_row)
+    except Exception:
+        pred = None
+
+    if pred is None:
         with cols[i]:
             st.info(f"{label} forecast will be available once more data is collected.")
         continue
 
-    pred = entry["predicted_aqi"]
     predictions[horizon_name] = pred
-    if entry.get("is_hazardous"):
+    if pred > HAZARD_THRESHOLD:
         hazard_horizons.append(label)
     cat, col_color, em = aqi_category(pred)
 
@@ -204,7 +245,6 @@ for i, (horizon_name, (label, days)) in enumerate(horizons.items()):
         </div>
         """, unsafe_allow_html=True)
 
-# Forward-looking hazard alert — distinct from the "current AQI is hazardous" banner above.
 if hazard_horizons:
     st.markdown(
         f'<div class="alert-banner">🚨 Forecast alert: hazardous AQI expected on {", ".join(hazard_horizons)}. '
@@ -216,15 +256,12 @@ if hazard_horizons:
 st.markdown("### 📈 Historical vs Predicted AQI")
 
 try:
-    hist_df = pd.DataFrame({
-        "Time": pd.to_datetime(features_df.tail(72)["datetime_utc"]),
-        "AQI": features_df.tail(72)["aqi"].astype(int),
-        "Series": "Historical",
-    })
+    hist_df = valid_df.tail(72)[["datetime_utc", "aqi"]].rename(columns={"datetime_utc": "Time", "aqi": "AQI"})
+    hist_df["Series"] = "Historical"
 
     if predictions:
         future_rows = []
-        for horizon_name, hours_ahead in [("24h", 24), ("48h", 48), ("72h", 72)]:
+        for horizon_name, (_, hours_ahead) in HORIZONS.items():
             if horizon_name in predictions:
                 future_rows.append({
                     "Time": latest_time + pd.Timedelta(hours=hours_ahead),
@@ -232,7 +269,6 @@ try:
                     "Series": "Predicted",
                 })
         pred_df = pd.DataFrame(future_rows)
-        # Bridge point so the predicted line connects visually to "now".
         bridge = pd.DataFrame([{"Time": latest_time, "AQI": latest_aqi, "Series": "Predicted"}])
         chart_df = pd.concat([hist_df, bridge, pred_df], ignore_index=True)
     else:
@@ -259,12 +295,12 @@ except Exception as e:
 # ---------- POLLUTANT BREAKDOWN ----------
 st.markdown("### 🧪 Current Pollutant Levels")
 p1, p2, p3, p4, p5, p6 = st.columns(6)
-p1.metric("PM2.5", f"{current['pm2_5']:.1f}")
-p2.metric("PM10", f"{current['pm10']:.1f}")
-p3.metric("CO", f"{current['co']:.1f}")
-p4.metric("NO2", f"{current['no2']:.2f}")
-p5.metric("O3", f"{current['o3']:.1f}")
-p6.metric("SO2", f"{current['so2']:.2f}")
+p1.metric("PM2.5", f"{latest_row['pm2_5']:.1f}")
+p2.metric("PM10", f"{latest_row['pm10']:.1f}")
+p3.metric("CO", f"{latest_row['co']:.1f}")
+p4.metric("NO2", f"{latest_row['no2']:.2f}")
+p5.metric("O3", f"{latest_row['o3']:.1f}")
+p6.metric("SO2", f"{latest_row['so2']:.2f}")
 
 st.markdown("""
 <div class="footer-note">
