@@ -8,4 +8,5 @@ joblib
 pyarrow
 confluent-kafka
 tensorflow
-hopsworks>=3.8.0,<4.0.0
+hopsworks>=5.0.0
+
