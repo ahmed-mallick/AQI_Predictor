@@ -11,7 +11,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 # ---------- CONFIG ----------
-HOPSWORKS_API_KEY = os.environ["HOPSWORKS_API_KEY"]
+HOPSWORKS_API_KEY = "wk2WQDxtwVmRTrM6.Jel2VY74EDLPU3vdGGJ7VVSG9fJEzaL6NpiWhb5AfdlpxcE5mvMGQ0QP5sdBuIGQ"
 WEATHER_FG_NAME = "karachi_weather_features"
 WEATHER_FG_VERSION = 1
 

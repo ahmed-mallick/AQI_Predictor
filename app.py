@@ -1,14 +1,21 @@
 import os
 import streamlit as st
 import pandas as pd
-import requests
 import altair as alt
-from datetime import datetime
+import hopsworks
+import joblib
 
 st.set_page_config(page_title="Karachi AQI Predictor", page_icon="🌫️", layout="wide")
 
-API_URL = os.environ.get("API_URL", "https://aqi-predictor-r4zk.onrender.com")
 HAZARD_THRESHOLD = 150
+WEATHER_FG_NAME = "karachi_weather_features"
+WEATHER_FG_VERSION = 1
+FEATURE_COLS = [
+    "hour", "day", "month", "day_of_week",
+    "pm2_5", "pm10", "co", "no2", "o3", "so2",
+    "aqi_lag_1", "aqi_lag_3", "aqi_rolling_mean_3", "aqi_change_rate",
+    "temperature", "humidity", "pressure", "wind_speed", "clouds",
+]
 
 # ---------- CUSTOM CSS (unchanged from original) ----------
 st.markdown("""
@@ -48,26 +55,83 @@ def aqi_category(aqi):
     else: return "Hazardous", "#7f1d1d", "🟤"
 
 
-@st.cache_data(ttl=1800)
-def get_current_aqi():
-    r = requests.get(f"{API_URL}/current", timeout=90)
-    r.raise_for_status()
-    return r.json()
+def get_hopsworks_api_key():
+    """Read the key locally from Streamlit secrets or an environment variable."""
+    try:
+        return st.secrets.get("HOPSWORKS_API_KEY", os.environ.get("HOPSWORKS_API_KEY", "")).strip()
+    except FileNotFoundError:
+        return os.environ.get("HOPSWORKS_API_KEY", "").strip()
+
+
+@st.cache_resource
+def get_project():
+    api_key = get_hopsworks_api_key()
+    if not api_key:
+        raise ValueError("HOPSWORKS_API_KEY is missing. Add it to .streamlit/secrets.toml.")
+    try:
+        project_name = st.secrets.get(
+            "HOPSWORKS_PROJECT_NAME", os.environ.get("HOPSWORKS_PROJECT_NAME", "")
+        ).strip()
+    except FileNotFoundError:
+        project_name = os.environ.get("HOPSWORKS_PROJECT_NAME", "").strip()
+    return hopsworks.login(
+        host="app.hopsworks.ai",
+        api_key_value=api_key,
+        project=project_name or None,
+    )
 
 
 @st.cache_data(ttl=1800)
-def get_history(hours=72):
-    r = requests.get(f"{API_URL}/history", params={"hours": hours}, timeout=90)
-    r.raise_for_status()
-    return r.json()
+def get_latest_features():
+    feature_store = get_project().get_feature_store()
+    pollution = feature_store.get_feature_group(name="karachi_aqi_features", version=1).read()
+    weather = feature_store.get_feature_group(
+        name=WEATHER_FG_NAME, version=WEATHER_FG_VERSION
+    ).read()
+    df = pd.merge(pollution, weather, on="timestamp", how="inner", suffixes=("", "_weather"))
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["aqi_lag_1"] = df["aqi"].shift(1)
+    df["aqi_lag_3"] = df["aqi"].shift(3)
+    df["aqi_rolling_mean_3"] = df["aqi"].rolling(window=3).mean()
+    df["aqi_change_rate"] = df["aqi"].diff()
+    return df
 
 
-@st.cache_data(ttl=1800)
-def get_predictions_all():
-    """One round trip for all 3 horizons instead of 3 separate calls."""
-    r = requests.get(f"{API_URL}/predict_all", timeout=90)
-    r.raise_for_status()
-    return r.json()
+@st.cache_resource
+def get_model(horizon_name):
+    model_dir = get_project().get_model_registry().get_model(
+        name=f"aqi_predictor_{horizon_name}"
+    ).download()
+    model_type_path = os.path.join(model_dir, "model_type.pkl")
+    model_type = joblib.load(model_type_path).get("type", "sklearn") if os.path.exists(model_type_path) else "sklearn"
+    if model_type == "nn":
+        import tensorflow as tf
+        return {"type": "nn", "model": tf.keras.models.load_model(os.path.join(model_dir, "nn_model.keras")), "scaler": joblib.load(os.path.join(model_dir, "scaler.pkl"))}
+    return {"type": "sklearn", "model": joblib.load(os.path.join(model_dir, "model.pkl"))}
+
+
+def get_current_aqi(df):
+    latest = df.iloc[-1]
+    return {
+        "aqi": int(latest["aqi"]), "pm2_5": float(latest["pm2_5"]),
+        "pm10": float(latest["pm10"]), "co": float(latest["co"]),
+        "no2": float(latest["no2"]), "o3": float(latest["o3"]),
+        "so2": float(latest["so2"]), "datetime_utc": str(latest["datetime_utc"]),
+    }
+
+
+def get_predictions_all(df):
+    latest_features = df.iloc[-1][FEATURE_COLS].to_frame().T.astype(float)
+    if latest_features.isnull().values.any():
+        return {}
+    predictions = {}
+    for horizon in ("24h", "48h", "72h"):
+        model_entry = get_model(horizon)
+        X = model_entry["scaler"].transform(latest_features) if model_entry["type"] == "nn" else latest_features
+        prediction = model_entry["model"].predict(X, verbose=0).flatten()[0] if model_entry["type"] == "nn" else model_entry["model"].predict(X)[0]
+        prediction = round(float(prediction))
+        predictions[horizon] = {"predicted_aqi": prediction, "is_hazardous": prediction > HAZARD_THRESHOLD}
+    return predictions
 
 
 # ---------- HEADER ----------
@@ -78,9 +142,10 @@ st.markdown("""
 
 with st.spinner("Loading latest data..."):
     try:
-        current = get_current_aqi()
+        features_df = get_latest_features()
+        current = get_current_aqi(features_df)
     except Exception as e:
-        st.error(f"Could not reach the prediction API. Make sure it's running. ({e})")
+        st.error(f"Could not load AQI data from Hopsworks. ({e})")
         st.stop()
 
 latest_aqi = current["aqi"]
@@ -111,8 +176,9 @@ predictions = {}
 hazard_horizons = []
 
 try:
-    all_preds = get_predictions_all()
-except Exception:
+    all_preds = get_predictions_all(features_df)
+except Exception as e:
+    st.warning(f"Forecast unavailable: {e}")
     all_preds = {}
 
 cols = st.columns(3)
@@ -150,10 +216,9 @@ if hazard_horizons:
 st.markdown("### 📈 Historical vs Predicted AQI")
 
 try:
-    hist = get_history(hours=72)
     hist_df = pd.DataFrame({
-        "Time": pd.to_datetime(hist["timestamps"]),
-        "AQI": hist["aqi"],
+        "Time": pd.to_datetime(features_df.tail(72)["datetime_utc"]),
+        "AQI": features_df.tail(72)["aqi"].astype(int),
         "Series": "Historical",
     })
 
